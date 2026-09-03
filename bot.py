@@ -1,7 +1,6 @@
 import hashlib
 import os
 import re
-from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -25,31 +24,38 @@ def telegram(text):
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         raise RuntimeError("Missing Telegram secrets")
-
     r = requests.post(
         f"https://api.telegram.org/bot{token}/sendMessage",
-        data={
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-        },
+        data={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False},
         timeout=30,
     )
     r.raise_for_status()
 
 
-def extract_provider_links(page):
-    """Read the current ServicePortal DOM after JavaScript has rendered it."""
-    links = page.locator('a[href*="/terminvereinbarung/termin/provider/"]').evaluate_all(
-        "els => els.map(a => ({text: a.innerText, href: a.href}))"
-    )
-
+def extract_location_pages(page):
+    links = page.locator("a").evaluate_all("els => els.map(a => ({text: a.innerText, href: a.href}))")
     result = []
     seen = set()
     for item in links:
         href = item["href"]
-        if "351180" not in href or href in seen:
+        if normalize(item["text"]) != "Mehr Infos":
+            continue
+        if "service.berlin.de" not in href or href in seen:
+            continue
+        seen.add(href)
+        result.append(href)
+    return result
+
+
+def extract_booking_links(page):
+    links = page.locator("a").evaluate_all("els => els.map(a => ({text: a.innerText, href: a.href}))")
+    result = []
+    seen = set()
+    for item in links:
+        href = item["href"]
+        if "/terminvereinbarung/termin/tag.php" not in href:
+            continue
+        if "351180" not in href or "id=" not in href or href in seen:
             continue
         seen.add(href)
         result.append((normalize(item["text"]) or "Berliner VHS", href))
@@ -57,9 +63,7 @@ def extract_provider_links(page):
 
 
 def page_has_real_slot(page):
-    """Detect an actual selectable appointment, not a generic booking button."""
     text = normalize(page.locator("body").inner_text()).lower()
-
     no_slot_markers = [
         "keine freien termine",
         "keine termine verfügbar",
@@ -70,41 +74,25 @@ def page_has_real_slot(page):
     if any(marker in text for marker in no_slot_markers):
         return False
 
-    # The appointment portal exposes actual date/time choices as links or buttons.
-    candidates = page.locator("a, button").all_inner_texts()
-    for raw in candidates:
+    for raw in page.locator("a, button").all_inner_texts():
         label = normalize(raw).lower()
-        if not label:
-            continue
         if re.search(r"\b\d{1,2}\.\d{1,2}\.\d{4}\b", label):
             return True
         if re.search(r"\b\d{1,2}:\d{2}\b", label) and re.search(r"termin|uhr", label):
             return True
         if re.search(r"termin\s+(auswählen|auswaehlen|verfügbar|verfuegbar)", label):
             return True
-
-    # Also inspect hrefs for appointment selection pages with date/time parameters.
-    hrefs = page.locator('a[href*="/terminvereinbarung/termin/"]').evaluate_all(
-        "els => els.map(a => a.href)"
-    )
-    for href in hrefs:
-        if "/provider/" not in href and ("datum" in href.lower() or "date" in href.lower()):
-            return True
-
     return False
 
 
 def check_with_browser():
     found = []
     errors = []
+    booking_links = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=HEADERS["User-Agent"],
-            locale="de-DE",
-            timezone_id="Europe/Berlin",
-        )
+        context = browser.new_context(user_agent=HEADERS["User-Agent"], locale="de-DE", timezone_id="Europe/Berlin")
         page = context.new_page()
         page.set_default_timeout(20000)
 
@@ -114,13 +102,41 @@ def check_with_browser():
                 page.wait_for_load_state("networkidle", timeout=20000)
             except PlaywrightTimeoutError:
                 pass
-            page.wait_for_timeout(2000)
-            provider_links = extract_provider_links(page)
+            page.wait_for_timeout(1500)
+            location_pages = extract_location_pages(page)
+            print(f"Found {len(location_pages)} official VHS location pages")
         except Exception as exc:
-            provider_links = []
+            location_pages = []
             errors.append(f"Central ServicePortal: {exc}")
 
-        for label, url in provider_links:
+        for location_url in location_pages:
+            try:
+                lpage = context.new_page()
+                lpage.goto(location_url, wait_until="domcontentloaded", timeout=60000)
+                try:
+                    lpage.wait_for_load_state("networkidle", timeout=15000)
+                except PlaywrightTimeoutError:
+                    pass
+                lpage.wait_for_timeout(800)
+                links = extract_booking_links(lpage)
+                if links:
+                    print(f"Booking link(s): {len(links)} from {location_url}")
+                booking_links.extend((label, url, location_url) for label, url in links)
+                lpage.close()
+            except Exception as exc:
+                errors.append(f"Location page {location_url}: {exc}")
+
+        unique = []
+        seen = set()
+        for label, url, location_url in booking_links:
+            if url in seen:
+                continue
+            seen.add(url)
+            unique.append((label, url, location_url))
+
+        print(f"Found {len(unique)} unique VHS booking calendars")
+
+        for label, url, location_url in unique:
             try:
                 ppage = context.new_page()
                 ppage.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -128,20 +144,22 @@ def check_with_browser():
                     ppage.wait_for_load_state("networkidle", timeout=20000)
                 except PlaywrightTimeoutError:
                     pass
-                ppage.wait_for_timeout(1500)
-                if page_has_real_slot(ppage):
-                    found.append((label, ppage.url))
+                ppage.wait_for_timeout(1200)
+                final_url = ppage.url
+                has_slot = page_has_real_slot(ppage)
+                print(f"Checked {label}: {'SLOT' if has_slot else 'no slot'} ({final_url})")
+                if has_slot:
+                    found.append((label, final_url))
                 ppage.close()
             except Exception as exc:
                 errors.append(f"{label}: {exc}")
 
         browser.close()
 
-    return provider_links, found, errors
+    return unique, found, errors
 
 
 def check_pankow():
-    """Pankow uses a separate registration process; detect changes on its official page."""
     try:
         r = requests.get(PANKOW_URL, headers=HEADERS, timeout=30)
         r.raise_for_status()
@@ -161,17 +179,13 @@ def check_pankow():
 
 
 def main():
-    provider_links, found, errors = check_with_browser()
-
+    booking_links, found, errors = check_with_browser()
     pankow_found, pankow_error = check_pankow()
     found.extend(pankow_found)
     if pankow_error:
         errors.append(pankow_error)
 
-    signature = hashlib.sha256(
-        "\n".join(f"{name}|{url}" for name, url in found).encode("utf-8")
-    ).hexdigest()
-
+    signature = hashlib.sha256("\n".join(f"{name}|{url}" for name, url in found).encode("utf-8")).hexdigest()
     old_signature = ""
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, encoding="utf-8") as f:
@@ -181,7 +195,7 @@ def main():
         lines = ["🚨 <b>Termin gefunden!</b>", ""]
         for name, url in found:
             lines.append(f"📍 <b>{name}</b>")
-            lines.append(f'🔗 <a href="{url}">Öffnen / buchen</a>')
+            lines.append(f'<a href="{url}">🔗 Öffnen / buchen</a>')
             if "Pankow" in name:
                 lines.append("ℹ️ Pankow hat ein eigenes Anmeldeverfahren – bitte die Seite sofort prüfen.")
             lines.append("")
@@ -194,7 +208,7 @@ def main():
         print("Warnings:")
         for error in errors:
             print(error)
-    print(f"Checked {len(provider_links)} VHS provider calendars; free/changed: {len(found)}")
+    print(f"Checked {len(booking_links)} VHS booking calendars; free/changed: {len(found)}")
 
 
 if __name__ == "__main__":
